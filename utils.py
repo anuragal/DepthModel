@@ -1,6 +1,7 @@
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
+from tqdm import notebook
 
 def DepthNorm(x, maxDepth):
     return maxDepth / x
@@ -12,7 +13,7 @@ def predict(model, images, minDepth=10, maxDepth=1000, batch_size=2):
     # Compute predictions
     predictions = model.predict(images, batch_size=batch_size)
     # Put in expected range
-    return np.clip(DepthNorm(predictions, maxDepth=maxDepth), minDepth, maxDepth) / maxDepth
+    return np.clip(DepthNorm(predictions, maxDepth=1000), minDepth, maxDepth) / maxDepth
 
 def scale_up(scale, images):
     from skimage.transform import resize
@@ -36,66 +37,29 @@ def to_multichannel(i):
     if i.shape[2] == 3: return i
     i = i[:,:,0]
     return np.stack((i,i,i), axis=2)
-        
-def display_images(outputs, inputs=None, gt=None, is_colormap=True, is_rescale=True,start = 0, end = 10):
+
+def display_images(filename, output_path, outputs, inputs=None, gt=None, is_colormap=True, is_rescale=True):
     import matplotlib.pyplot as plt
     import skimage
     from skimage.transform import resize
 
-    plasma = plt.get_cmap('plasma')
-
-    shape = (outputs[0].shape[0], outputs[0].shape[1], 3)
-    print(shape)
+    plasma = plt.get_cmap('gray')
+    #shape = (outputs[0].shape[0], outputs[0].shape[1], 3)
     
-    #all_images = []
-
-    for i in range(end-start):
-       # imgs = []
+    for i in range(outputs.shape[0]):
+        imgs = []
         
-        # if isinstance(inputs, (list, tuple, np.ndarray)):
-        #     x = to_multichannel(inputs[i])
-        #     x = resize(x, shape, preserve_range=True, mode='reflect', anti_aliasing=True )
-        #     #imgs.append(x)
+        rescaled = outputs[i][:,:,0]
+        if is_rescale:
+            rescaled = rescaled - np.min(rescaled)
+            rescaled = rescaled / np.max(rescaled)
+        matplotlib_image = plt.imshow(plasma(rescaled)[:,:,:3])
 
-        # if isinstance(gt, (list, tuple, np.ndarray)):
-        #     x = to_multichannel(gt[i])
-        #     x = resize(x, shape, preserve_range=True, mode='reflect', anti_aliasing=True )
-        #     imgs.append(x)
-
-        if is_colormap:
-            rescaled = outputs[i][:,:,0]
-            #print(rescaled.shape)
-            print(rescaled.shape)
-            if is_rescale:
-                rescaled = rescaled - np.min(rescaled)
-                rescaled = rescaled / np.max(rescaled)
-            print(rescaled.shape)
-            
-            # img = Image.fromarray(plasma(rescaled)[:,:,:3],mode="RGB")
-            # img.save(f"test{str(start)}.jpg")
-            plt.figure(figsize=(2.24,2.24),dpi=100)
-            plt.imshow(plasma(rescaled)[:,:,:3])
-            plt.axis("off")
-            plt.savefig(f"test{str(start)}.jpg")
-        start+=1
-        print(start)
-
-
+        pil_image = Image.fromarray(np.uint8( ( matplotlib_image.get_array()*255))).convert("L").resize((224,224))
+        pil_image.save(os.path.join(output_path, "depth_" + filename + ".jpg"))
+        plt.close()
         
-        #start+=1   
-        #print(start)
-        # else:
-        #     imgs.append(to_multichannel(outputs[i]))
-
-        # img_set = np.hstack(imgs)
-        # plt.imshow(img_set)
-        # plt.axis("off")
-        # plt.savefig("imgggg.jpg")
-        # all_images.append(img_set)
-
-    # all_images = np.stack(all_images)
-    
-    
+    return True
 
 def save_images(filename, outputs, inputs=None, gt=None, is_colormap=True, is_rescale=False):
     montage =  display_images(outputs, inputs, is_colormap, is_rescale)
@@ -114,26 +78,29 @@ def load_test_data(test_data_zip_file='nyu_test.zip'):
     print('Test data loaded.\n')
     return {'rgb':rgb, 'depth':depth, 'crop':crop}
 
-def compute_errors(gt, pred):
-    thresh = np.maximum((gt / pred), (pred / gt))
-    a1 = (thresh < 1.25   ).mean()
-    a2 = (thresh < 1.25 ** 2).mean()
-    a3 = (thresh < 1.25 ** 3).mean()
-    abs_rel = np.mean(np.abs(gt - pred) / gt)
-    rmse = (gt - pred) ** 2
-    rmse = np.sqrt(rmse.mean())
-    log_10 = (np.abs(np.log10(gt)-np.log10(pred))).mean()
-    return a1, a2, a3, abs_rel, rmse, log_10
+def evaluate(model, rgb, depth, crop, batch_size=6, verbose=True):
+    # Error computaiton based on https://github.com/tinghuiz/SfMLearner
+    def compute_errors(gt, pred):
+        thresh = np.maximum((gt / pred), (pred / gt))
+        
+        a1 = (thresh < 1.25   ).mean()
+        a2 = (thresh < 1.25 ** 2).mean()
+        a3 = (thresh < 1.25 ** 3).mean()
 
-def evaluate(model, rgb, depth, crop, batch_size=6, verbose=False):
-    N = len(rgb)
+        abs_rel = np.mean(np.abs(gt - pred) / gt)
+
+        rmse = (gt - pred) ** 2
+        rmse = np.sqrt(rmse.mean())
+
+        log_10 = (np.abs(np.log10(gt)-np.log10(pred))).mean()
+
+        return a1, a2, a3, abs_rel, rmse, log_10
+
+    depth_scores = np.zeros((6, len(rgb))) # six metrics
 
     bs = batch_size
 
-    predictions = []
-    testSetDepths = []
-    
-    for i in range(N//bs):    
+    for i in range(len(rgb)//bs):    
         x = rgb[(i)*bs:(i+1)*bs,:,:,:]
         
         # Compute results
@@ -150,13 +117,12 @@ def evaluate(model, rgb, depth, crop, batch_size=6, verbose=False):
         
         # Compute errors per image in batch
         for j in range(len(true_y)):
-            predictions.append(   (0.5 * pred_y[j]) + (0.5 * np.fliplr(pred_y_flip[j]))   )
-            testSetDepths.append(   true_y[j]   )
+            errors = compute_errors(true_y[j], (0.5 * pred_y[j]) + (0.5 * np.fliplr(pred_y_flip[j])))
+            
+            for k in range(len(errors)):
+                depth_scores[k][(i*bs)+j] = errors[k]
 
-    predictions = np.stack(predictions, axis=0)
-    testSetDepths = np.stack(testSetDepths, axis=0)
-
-    e = compute_errors(predictions, testSetDepths)
+    e = depth_scores.mean(axis=1)
 
     if verbose:
         print("{:>10}, {:>10}, {:>10}, {:>10}, {:>10}, {:>10}".format('a1', 'a2', 'a3', 'rel', 'rms', 'log_10'))
